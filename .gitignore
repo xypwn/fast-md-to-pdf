@@ -1,0 +1,6 @@
+/.build
+/fast-md-to-pdf
+/fast-md-to-pdf.exe
+/fast-md-to-pdf.pdb
+
+/*.pdf
