@@ -1,5 +1,5 @@
 # Fast MD to PDF
-Addressing the severe lack of Markdown to PDF converters with reasonable speed.
+This is mostly an experiment for learning the JAI programming language.
 
 Both the Markdown parser and PDF generator are written from scratch, so **many features are still missing**.
 
@@ -13,8 +13,14 @@ $ jai first.jai -x64
 ```
 
 ## Usage
+#### CLI Options
 ```
 $ ./fast-md-to-pdf input_file.md [output_file[.pdf]] [-watch]
+```
+
+#### Basic example (this README)
+```
+$ ./fast-md-to-pdf README.md
 ```
 
 ## Features
@@ -25,20 +31,20 @@ $ ./fast-md-to-pdf input_file.md [output_file[.pdf]] [-watch]
 ### Present
 - Paragraph text (duh)
 - Headings
-- Styling: Bold, Italic
-- Code block
-- Horizontal rule
-
-### Missing
+- Styling: Bold, Italic, Subscript, Superscript, Code
+- Code blocks
+- Horizontal rules
 - Backslash escaping
 - Bullet lists
+
+### Missing
 - Numbered lists
 - Checkbox lists
+- Styling: Strikethrough
 - Tables
 - HTML tag syntax
 - Block quotes
 - Images
 - Links
 - Alternative horizontal rule syntax
-- Inline code blocks
-- Syntax highlighting (not really planned because seems complicated)
+- Syntax highlighting (not really planned because it seems complicated)

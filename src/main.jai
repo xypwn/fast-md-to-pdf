@@ -160,6 +160,8 @@ convert_md_to_pdf :: (md_text: string) -> pdf_document: string {
                 print("'%' %\n", c, token.char);
             } else if token.type == .LINE_BREAK
                 print("% %\n", token.type, token.line_break);
+            else if token.type == .SET_INDENT
+                print("% %\n", token.type, token.indent);
             else
                 print("%\n", token.type);
         }
@@ -170,6 +172,8 @@ convert_md_to_pdf :: (md_text: string) -> pdf_document: string {
         PDF_Builder :: struct {
             last_was_monospace: bool;
             last_char_modifiers: Md.Char_Modifiers;
+
+            current_indent: s16;
 
             current_words:  [..]Pdf.Item.Text.Word;
             current_blocks: [..]Pdf.Item.Text.Word.Block;
@@ -184,13 +188,13 @@ convert_md_to_pdf :: (md_text: string) -> pdf_document: string {
             
             font_size: s32;
             if last_char_modifiers & .HEADING_BITS == {
-                case 0;   font_size = 12;
-                case .H1; font_size = 32;
-                case .H2; font_size = 26;
-                case .H3; font_size = 22;
-                case .H4; font_size = 18;
+                case 0;   font_size = 13;
+                case .H1; font_size = 30;
+                case .H2; font_size = 24;
+                case .H3; font_size = 19;
+                case .H4; font_size = 17;
                 case .H5; font_size = 16;
-                case .H6; font_size = 14;
+                case .H6; font_size = 15;
             }
 
             text_rise: s32;
@@ -227,6 +231,9 @@ convert_md_to_pdf :: (md_text: string) -> pdf_document: string {
         flush_current_word :: (using pdf_builder: *PDF_Builder) {
             flush_current_block(pdf_builder);
 
+            if !current_blocks
+                return;
+
             array_add(*current_words, .{
                 blocks          = current_blocks,
             });
@@ -239,8 +246,12 @@ convert_md_to_pdf :: (md_text: string) -> pdf_document: string {
         flush_current_item :: (using pdf_builder: *PDF_Builder, pdf_items: *[..]Pdf.Item) {
             flush_current_word(pdf_builder);
 
+            if !current_words
+                return;
+
             array_add(pdf_items, .{
                 type = .TEXT,
+                indent = current_indent*20,
                 text = .{
                     spread_words = !last_was_monospace,
                     words = current_words,
@@ -280,6 +291,7 @@ convert_md_to_pdf :: (md_text: string) -> pdf_document: string {
                             } else {
                                 array_add(*pdf_items, .{type = .VSPACE, vspace = 3});
                             }
+                            array_add(*pdf_items, .{type = .VSPACE, vspace = 4});
                         } else {
                             array_add(*pdf_items, .{type = .VSPACE, vspace = 4});
                         }
@@ -291,6 +303,58 @@ convert_md_to_pdf :: (md_text: string) -> pdf_document: string {
                     array_add(*pdf_items, .{type = .VSPACE, vspace = 8});
                 case .IMAGE;
                     // TODO
+                case .SYMBOL;
+                    if #complete token.symbol == {
+                        case .BULLET_POINT;
+                            array_add(
+                                *pdf_items,
+                                .{
+                                    type = .TEXT,
+                                    indent = current_indent*20,
+                                    text = .{words = .[.{blocks = .[.{
+                                        font = "ZapfDingbats",
+                                        font_size = 12,
+                                        xfloat = -10,
+                                        text = "\x6c",
+                                    }]}]},
+                                }
+                            );
+                        case .CHECKBOX_UNCHECKED;
+                            array_add(
+                                *pdf_items,
+                                .{
+                                    type = .TEXT,
+                                    indent = current_indent*20,
+                                    text = .{words = .[.{blocks = .[.{
+                                        font = "ZapfDingbats",
+                                        font_size = 12,
+                                        xfloat = -11,
+                                        text = "\x71",
+                                    }]}]},
+                                }
+                            );
+                            #through;
+                        case .CHECKBOX_CHECKED;
+                            array_add(
+                                *pdf_items,
+                                .{
+                                    type = .TEXT,
+                                    indent = current_indent*20,
+                                    text = .{words = .[.{blocks = .[.{
+                                        font = "ZapfDingbats",
+                                        font_size = 12,
+                                        xfloat = -10,
+                                        rise = 2,
+                                        text = "\x34",
+                                    }]}]},
+                                }
+                            );
+                    }
+                case .SET_INDENT;
+                    flush_current_item(*pdf_builder, *pdf_items);
+                    current_indent = token.indent;
+                case .SET_LINK;
+
             }
         }
         flush_current_item(*pdf_builder, *pdf_items);

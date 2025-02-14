@@ -1,3 +1,5 @@
+#module_parameters(TAB_WIDTH := 4);
+
 parse :: (code: string) -> Document {
     input := Input.{
         text = code,
@@ -25,6 +27,9 @@ Token_Type :: enum u8 {
     LINE_BREAK;
     HORIZONTAL_RULE;
     IMAGE;
+    SYMBOL;
+    SET_LINK;
+    SET_INDENT;
 }
 
 Token :: struct {
@@ -33,12 +38,14 @@ Token :: struct {
         char: struct {
             char: u8;
             modifiers: Char_Modifiers;
-            link_index: s16 = -1;
-            image_index: s16 = -1;
         }
         line_break: struct {
             previous_modifiers: Char_Modifiers;
         }
+        image_index: s16;
+        link_index: s16;
+        indent: s16;
+        symbol: Symbol;
     }
 }
 
@@ -65,6 +72,12 @@ Char_Modifiers :: enum u16 {
     #insert #run char_modifier_combinations();
 }
 
+Symbol :: enum u8 {
+    BULLET_POINT;
+    CHECKBOX_UNCHECKED;
+    CHECKBOX_CHECKED;
+}
+
 #scope_file
 
 parse_toplevel :: (using input: *Input, output: *Document) {
@@ -76,8 +89,6 @@ parse_toplevel :: (using input: *Input, output: *Document) {
     }
 
     while 1 {
-        eat_spaces(input);
-
         c := peek_char(input);
         if c == -1 {
             parse_section(slice(input, section_start, cursor), output);
@@ -91,11 +102,25 @@ parse_toplevel :: (using input: *Input, output: *Document) {
         // We should always land on a newline here.
 
         line_start := cursor;
-        eat_spaces(input);
+        num_leading_spaces := eat_spaces(input);
         c = peek_char(input);
-        if is_newline(c) { // empty line
+        if c == #char "\\" { // ignore if escaped
+        } else if is_newline(c) { // empty line
             parse_section(slice(input, section_start, line_start), output);
             section_start = cursor;
+        } else if c == #char "-" { // bullet point
+            eat_char(input);
+            if eat_spaces(input) {
+                bp_text_start := cursor;
+                eat_while(input, (c) => !is_newline(c));
+                parse_section(slice(input, section_start, line_start), output);
+                indent := ((num_leading_spaces+3)/4 + 1).(s16);
+                emit_token(output, .{type=.SET_INDENT, indent=indent});
+                emit_token(output, .{type=.SYMBOL, symbol=.BULLET_POINT});
+                parse_section(slice(input, bp_text_start, cursor), output);
+                emit_token(output, .{type=.SET_INDENT, indent=0});
+                section_start = cursor;
+            }
         } else if c == #char "*" { // horizontal rule
             num_stars := eat_while(input, #char "*");
             if num_stars >= 3 {
@@ -149,6 +174,7 @@ parse_toplevel :: (using input: *Input, output: *Document) {
                         }
                         eat_char(input);
                     }
+                    parse_section(slice(input, section_start, line_start), output);
                     //language := slice(input, first_line_start, first_line_end);
                     // TODO: Syntax highlighting?
                     content := slice(input, content_start, content_end);
@@ -172,10 +198,8 @@ parse_toplevel :: (using input: *Input, output: *Document) {
             if heading_level <= 6 {
                 heading_modifier := Char_Modifiers.[0, .H1, .H2, .H3, .H4, .H5, .H6][heading_level];
 
-                heading_text_start := cursor;
-                c = peek_char(input);
-                if is_space(c) {
-                    eat_spaces(input);
+                if eat_spaces(input) {
+                    heading_text_start := cursor;
                     eat_while(input, (c) => !is_newline(c));
                     parse_section(slice(input, section_start, line_start), output);
                     parse_section(
@@ -191,9 +215,11 @@ parse_toplevel :: (using input: *Input, output: *Document) {
         eat_while(input, (c) => !is_newline(c));
         eat_newline(input);
     }
+
+    tokens_trim_from_end(output, .LINE_BREAK);
 }
 
-parse_text :: (input: *Input, output: *Document, modifiers: Char_Modifiers) -> err: string {
+parse_text :: (using input: *Input, output: *Document, modifiers: Char_Modifiers) -> err: string {
     handle_modifier :: (
         using input: *Input, output: *Document, modifiers: Char_Modifiers,
         modifier_chars: string, modifier_flags: Char_Modifiers
@@ -226,17 +252,19 @@ parse_text :: (input: *Input, output: *Document, modifiers: Char_Modifiers) -> e
         return true;
     }
 
+    // TODO: Remove eat_newlines_and_spaces completely since it doesn't track leading spaces
     eat_newlines_and_spaces(input);
     c := peek_char(input);
     if c == -1  return "";
 
-    last_was_space := false;
     while 1 {
+        eat_and_emit_escaped_chars(input, output, modifiers);
+
         c = peek_char(input);
         if c == -1  break;
         if is_space(c) || is_newline(c) {
             eat_newlines_and_spaces(input);
-            last_was_space = true;
+            emit_token_if_last_type(output, .{type = .WORD_BREAK}, .CHAR);
         } else if handle_modifier(input, output, modifiers, "***", .ITALIC_BOLD) {
         } else if handle_modifier(input, output, modifiers, "**", .BOLD) {
         } else if handle_modifier(input, output, modifiers, "*", .ITALIC) {
@@ -248,15 +276,37 @@ parse_text :: (input: *Input, output: *Document, modifiers: Char_Modifiers) -> e
             handle_modifier(input, output, modifiers, "~", .SUBSCRIPT) {
         } else if !(modifiers & .SUBSCRIPT) &&
             handle_modifier(input, output, modifiers, "^", .SUPERSCRIPT) {
-        } else {
-            if last_was_space {
-                emit_token(output, .{type = .WORD_BREAK});
-                last_was_space = false;
+        } else if c == #char "`" {
+            num_backticks := eat_while(input, #char "`");
+            if num_backticks == 2 {
+                for 1..num_backticks
+                    emit_text(output, "`", modifiers);
+            } else {
+                content_start := cursor;
+                while 1 {
+                    c = peek_char(input);
+                    if c == -1 {
+                        for 1..num_backticks
+                            emit_text(output, "`", modifiers);
+                        cursor = content_start;
+                        break;
+                    }
+                    pos := cursor;
+                    if eat_while(input, #char "`") >= num_backticks {
+                        content := slice(input.*, content_start, pos);
+                        emit_text(output, content.text, modifiers | .MONOSPACE);
+                        break;
+                    }
+                    eat_char(input);
+                }
             }
+        } else {
             emit_char(output, c, modifiers);
             eat_char(input);
         }
     }
+
+    tokens_trim_from_end(output, .WORD_BREAK);
 
     return "";
 }
@@ -290,23 +340,34 @@ char_modifier_combinations :: () -> string #expand {
 }
 
 emit_line_break :: (using output: *Document, previous_modifiers: Char_Modifiers) {
-    inline emit_token_unless_last_type(output, .{
+    inline emit_token_if_last_type(output, .{
         type = .LINE_BREAK,
         line_break = .{
             previous_modifiers = previous_modifiers,
         },
-    }, .LINE_BREAK, .HORIZONTAL_RULE);
+    }, .CHAR, .WORD_BREAK);
 }
 
-emit_token_unless_last_type :: (using output: *Document, token: Token, exclude_types: .. Token_Type) {
+emit_token_if_last_type :: (using output: *Document, token: Token, allowed_types: .. Token_Type, dont_emit_if_first_token := true) {
+    if dont_emit_if_first_token && tokens.count == 0
+        return;
     if tokens.count == 0
-    || !array_find(exclude_types, tokens[tokens.count-1].type) {
+    || array_find(allowed_types, tokens[tokens.count-1].type) {
         emit_token(output, token);
     }
 }
 
 emit_token :: inline (output: *Document, token: Token) {
     array_add(*output.tokens, token);
+}
+
+tokens_trim_from_end :: inline (using output: *Document, types: .. Token_Type) {
+    while tokens.count > 0 {
+        if array_find(types, tokens[tokens.count-1].type)
+            tokens.count -= 1;
+        else
+            break;
+    }
 }
 
 emit_char :: inline (output: *Document, char: s16, modifiers: Char_Modifiers) {
@@ -327,6 +388,22 @@ emit_char :: inline (output: *Document, char: u8, modifiers: Char_Modifiers) {
 emit_text :: inline (output: *Document, text: string, modifiers: Char_Modifiers) {
     for text
         emit_char(output, it, modifiers);
+}
+
+eat_and_emit_escaped_chars :: (input: *Input, output: *Document, modifiers: Char_Modifiers) {
+    while 1 {
+        c := peek_char(input);
+        if c == #char "\\" {
+            eat_char(input);
+            c = peek_char(input);
+            eat_char(input);
+            if !is_escapable(c)
+                emit_char(output, #char "\\", modifiers);
+            if c != -1
+                emit_char(output, c.(u8), modifiers);
+        } else
+            break;
+    }
 }
 
 Position :: struct {
@@ -368,8 +445,22 @@ peek_char :: (using input: *Input) -> s16 {
     return text[cursor.cursor];
 }
 
-eat_spaces :: inline (input: *Input) -> ate: bool {
-    return eat_while(input, (_, c) => is_space(c), void) > 0;
+// Returns the number of eaten spaces. Tabs count as TAB_WIDTH spaces.
+eat_spaces :: inline (input: *Input) -> num_eaten: s64 {
+    n := 0;
+    while 1 {
+        c := peek_char(input);
+        if c == {
+            case #char " ";   n += 1;
+            case #char "\t";  n += TAB_WIDTH;
+            case;             return n;
+        }
+        eat_char(input);
+    }
+
+    // compiler doesn't understand that this is unreachable
+    assert(false);
+    return 0;
 }
 
 eat_newlines_and_spaces :: inline (input: *Input) -> ate: bool {
@@ -426,7 +517,7 @@ eat_if_next_chars :: (using input: *Input, sequence: string) -> bool {
     return true;
 }
 
-eat_newline :: inline (input: *Input) {
+eat_newline :: (input: *Input) {
     c := peek_char(input);
     if c == #char "\r" {
         eat_char(input);
@@ -436,12 +527,36 @@ eat_newline :: inline (input: *Input) {
         eat_char(input);
 }
 
-is_newline :: (c: s16) -> bool {
+is_newline :: inline (c: s16) -> bool {
     return c == -1 || c == #char "\n" || c == #char "\r";
 }
 
-is_space :: (c: s16) -> bool {
+is_space :: inline (c: s16) -> bool {
     return c == #char " " || c == #char "\t";
+}
+
+is_escapable :: (c: s16) -> bool {
+    if c == {
+        case #char "\\"; #through;
+        case #char "`"; #through;
+        case #char "*"; #through;
+        case #char "_"; #through;
+        case #char "{"; #through;
+        case #char "}"; #through;
+        case #char "["; #through;
+        case #char "]"; #through;
+        case #char "<"; #through;
+        case #char ">"; #through;
+        case #char "("; #through;
+        case #char ")"; #through;
+        case #char "#"; #through;
+        case #char "+"; #through;
+        case #char "-"; #through;
+        case #char "."; #through;
+        case #char "!"; #through;
+        case #char "|"; return true;
+    }
+    return false;
 }
 
 #import "Basic";

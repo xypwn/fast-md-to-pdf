@@ -41,6 +41,8 @@ Item_Type :: enum u8 {
 Text_Font_Properties :: struct {
     font_size: s32 = 10; // font size in pt
     rise: s32 = 0;       // vertical offset in pt (e.g. for sub-/superscript)
+    xfloat: s32 = 0;     // if nonzero: text has no width and has the specified X offset in pt
+    strikethrough := false; // TODO
 }
 
 operator == :: inline (a: Text_Font_Properties, b: Text_Font_Properties) -> bool {
@@ -69,6 +71,11 @@ Item :: struct {
     }
 
     type: Item_Type;
+
+    // Additional left margin in pt (e.g. for
+    // block quotes).
+    indent: s32 = 0;
+
     union {
         text: Text;
         vspace: s32;
@@ -280,7 +287,7 @@ END,
             rs.currently_used_image_indices.data = null;
         }
 
-        flush_current_line :: (rs: *Render_State, page_info: Page_Info, spread_words: bool, max_chars: s32 = -1) {
+        flush_current_line :: (rs: *Render_State, page_info: Page_Info, indent_mpt: s32, spread_words: bool, max_chars: s32 = -1) {
             //print("### %\n", rs.current_words);
 
             skip_chars := rs.skip_chars_in_next_line;
@@ -289,29 +296,37 @@ END,
             // Spreading words doesn't make sense in that line.
             assert(max_chars == -1 || spread_words || rs.current_words.count <= 1, "cannot have max chars and spread words simultaneously");
 
+            word_has_physical_content :: (w: Item.Text.Word) -> bool {
+                for w.blocks if !it.xfloat && it.text
+                    return true;
+                return false;
+            }
+
             CMD_TEXT_START :: "  [";
             CMD_TEXT_END   :: "] TJ\n";
+            line_is_started := false;
             text_cmd_is_started := false;
-            if rs.current_words.count > 0 {
+            if rs.current_words {
                 space_width_mpt: float;
                 if spread_words && rs.current_words.count > 1 {
-                    page_width_pt := page_info.max_text_x_pt - page_info.min_text_x_pt;
+                    page_width_pt := page_info.max_text_x_pt - (page_info.min_text_x_pt + indent_mpt/1000);
                     space_count: s32;
                     chars_width_mpt := 0;
                     num_chars: s32;
                     is_first_word := true;
                     for word : rs.current_words {
-                        if !is_first_word && num_chars >= skip_chars
+                        has_content := word_has_physical_content(word);
+                        if !is_first_word && num_chars >= skip_chars && has_content
                             space_count += 1;
                         for block, block_index : word.blocks {
                             font := word.block_fonts[block_index];
                             for block.text {
-                                if num_chars >= skip_chars
+                                if num_chars >= skip_chars && !block.xfloat
                                     chars_width_mpt += font.glyph_widths[it] * block.font_size;
                                 num_chars += 1;
                             }
                         }
-                        if num_chars >= skip_chars
+                        if num_chars >= skip_chars && has_content
                             is_first_word = false;
                     }
                     space_left_width_mpt := page_width_pt * 1000 - chars_width_mpt;
@@ -332,6 +347,7 @@ END,
                       { // Immediately stop when past max chars.
                         break;
                     }
+                    has_physical_content := word_has_physical_content(word);
                     for block, block_index : word.blocks {
                         font := word.block_fonts[block_index];
                         if !is_current_font(rs, font, block.properties) {
@@ -344,16 +360,35 @@ END,
                         if !text_cmd_is_started { // ensure we're in a text command
                             append(*rs.current_page_text_cmds, CMD_TEXT_START);
                             text_cmd_is_started = true;
+                            if !line_is_started {
+                                // Add indent at beginning of line.
+                                print_integer(*rs.current_page_text_cmds, .{value=-indent_mpt/block.font_size});
+                                append(*rs.current_page_text_cmds, " ");
+                                line_is_started = true;
+                            }
+                        }
+                        xfloat_text_width := 0;
+                        xfloat_offset := block.xfloat*1000/block.font_size;
+                        if block.xfloat {
+                            print_integer(*rs.current_page_text_cmds, .{value=-xfloat_offset});
+                            append(*rs.current_page_text_cmds, " ");
                         }
                         append(*rs.current_page_text_cmds, " (");
                         for block.text {
-                            if num_chars >= skip_chars && (max_chars == -1 || num_chars < max_chars)
+                            if num_chars >= skip_chars && (max_chars == -1 || num_chars < max_chars) {
                                 print_pdf_escaped_char(*rs.current_page_text_cmds, it);
+                                if block.xfloat
+                                    xfloat_text_width += font.glyph_widths[it];
+                            }
                             num_chars += 1;
                         }
                         append(*rs.current_page_text_cmds, ") ");
+                        if block.xfloat {
+                            print_integer(*rs.current_page_text_cmds, .{value=xfloat_text_width+xfloat_offset});
+                            append(*rs.current_page_text_cmds, " ");
+                        }
                     }
-                    if rs.current_font != null && word_index != rs.current_words.count-1 {
+                    if rs.current_font != null && word_index != rs.current_words.count-1 && has_physical_content {
                         space_width: float;
                         if space_width_mpt == 0
                             space_width = rs.current_font.glyph_widths[#char " "].(float);
@@ -388,8 +423,17 @@ END,
             array_reset_keeping_memory(*rs.current_words);
         }
 
+        is_line_start := true;
+        line_start_indent_mpt: s32 = 0;
         for item, item_index : items {
             rs.is_new_block = true;
+            if item.type == .TEXT || item.type == .IMAGE {
+                if is_line_start {
+                    line_start_indent_mpt = item.indent*1000;
+
+                    is_line_start = false;
+                }
+            }
             if item.type == .TEXT {
                 Iter_State :: struct {
                     word_index := 0;
@@ -434,7 +478,7 @@ END,
                         && char_index == block.text.count-1;
 
                     if rs.prepend_new_page {
-                        flush_current_line(*rs, page_info, false);
+                        flush_current_line(*rs, page_info, line_start_indent_mpt, false);
                         print(*rs.current_page_text_cmds,
                             "  % % Td \n",
                             page_info.min_text_x_pt,
@@ -484,7 +528,7 @@ END,
                         rs.current_font_properties = .{};
                     }
                     if rs.prepend_new_page || rs.prepend_new_lines > 0 {
-                        rs.next_char_x_mpt = page_info.min_text_x_pt*1000;
+                        rs.next_char_x_mpt = page_info.min_text_x_pt*1000 + line_start_indent_mpt;
                     }
                     font := resolved_block_fonts[item_index][word_index][block_index];
                     if rs.prepend_new_lines > 0 {
@@ -499,12 +543,12 @@ END,
                     rs.prepend_new_lines = 0;
 
                     inc_char := false;
-                    glyph_width_mpt := font.glyph_widths[char] * block.font_size;
+                    glyph_width_mpt := ifx block.xfloat then 0 else font.glyph_widths[char] * block.font_size;
                     if
                       // New char would overflow the current line.
                       rs.next_char_x_mpt + glyph_width_mpt >= page_info.max_text_x_pt*1000
                       // Char CAN theoretically fit into the page width.
-                      && page_info.min_text_x_pt*1000 + glyph_width_mpt < page_info.max_text_x_pt*1000 {
+                      && page_info.min_text_x_pt*1000 + line_start_indent_mpt + glyph_width_mpt < page_info.max_text_x_pt*1000 {
                         if rs.current_words.count == 0 {
                             // The overflow happened in the first word
                             // => we have to chop the word up.
@@ -517,10 +561,10 @@ END,
                                 word = word,
                                 block_fonts = resolved_block_fonts[item_index][word_index],
                             });
-                            flush_current_line(*rs, page_info, false, max_chars=num_chars);
+                            flush_current_line(*rs, page_info, line_start_indent_mpt, false, max_chars=num_chars);
                             rs.skip_chars_in_next_line = num_chars;
                         } else {
-                            flush_current_line(*rs, page_info, item.text.spread_words);
+                            flush_current_line(*rs, page_info, line_start_indent_mpt, item.text.spread_words);
                             restore_iter_state_to_word_beginning = true;
                         }
                         rs.prepend_new_lines += 1;
@@ -553,19 +597,22 @@ END,
                         char_index += 1;
                 }
             } else if item.type == .NEWLINE {
-                flush_current_line(*rs, page_info, false);
+                flush_current_line(*rs, page_info, line_start_indent_mpt, false);
+                is_line_start = true;
                 rs.prepend_new_lines += 1;
             } else if item.type == .VSPACE {
                 // TODO: See if this also works right after starting
                 // a new page (probably not).
-                flush_current_line(*rs, page_info, false);
+                flush_current_line(*rs, page_info, line_start_indent_mpt, false);
+                is_line_start = true;
                 rs.next_char_y_pt -= item.vspace;
                 print(*rs.current_page_text_cmds,
                     "  0 % Td\n",
                     -item.vspace,
                 );
             } else if item.type == .HRULE {
-                flush_current_line(*rs, page_info, false);
+                flush_current_line(*rs, page_info, line_start_indent_mpt, false);
+                is_line_start = true;
                 print(*rs.current_page_draw_cmds, #string END
   0.0 0.0 0.0 RG
   % % m
@@ -578,7 +625,7 @@ END,
                     rs.next_char_y_pt,
                 );
             } else if item.type == .IMAGE {
-                flush_current_line(*rs, page_info, false);
+                flush_current_line(*rs, page_info, line_start_indent_mpt, false);
 
                 assert(item.image_index >= 0 && item.image_index < images.count, "PDF: Image index out of bounds.");
                 image := images[item.image_index];
@@ -617,7 +664,7 @@ END,
             } else
                 assert(false);
         }
-        flush_current_line(*rs, page_info, false);
+        flush_current_line(*rs, page_info, line_start_indent_mpt, false);
         flush_page(*pages, *rs);
     }
 
@@ -823,6 +870,12 @@ CORE_FONTS :: Core_Font.[
         underline_position = -100,
         underline_thickness = 50,
         glyph_widths = .[250,250,250,250,250,250,250,250,250,250,250,250,250,250,250,250,250,250,250,250,250,250,250,250,250,250,250,250,250,250,250,250,250,389,555,500,500,833,778,278,333,333,500,570,250,333,250,278,500,500,500,500,500,500,500,500,500,500,333,333,570,570,570,500,832,667,667,667,722,667,667,722,778,389,500,667,611,889,722,722,611,722,667,556,611,722,667,889,667,611,611,333,278,333,570,500,333,500,500,444,500,444,333,500,556,278,278,500,278,778,556,500,500,500,389,389,278,556,444,667,500,444,389,348,220,348,570,350,500,350,333,500,500,1000,500,500,333,1000,556,333,944,350,611,350,350,333,333,500,500,350,500,1000,333,1000,389,333,722,350,389,611,250,389,500,500,500,500,220,500,333,747,266,500,606,333,747,333,400,570,300,300,333,576,500,250,333,300,300,500,750,750,750,500,667,667,667,667,667,667,944,667,667,667,667,667,389,389,389,389,722,722,722,722,722,722,722,570,722,722,722,722,722,611,611,500,500,500,500,500,500,500,722,444,444,444,444,444,278,278,278,278,500,556,500,500,500,500,500,570,500,556,556,556,556,444,500,444],
+    },
+    .{
+        name = "ZapfDingbats",
+        underline_position = -100,
+        underline_thickness = 50,
+        glyph_widths = .[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,278,974,961,974,980,719,789,790,791,690,960,939,549,855,911,933,911,945,974,755,846,762,761,571,677,763,760,759,754,494,552,537,577,692,786,788,788,790,793,794,816,823,789,841,823,833,816,831,923,744,723,749,790,792,695,776,768,792,759,707,708,682,701,826,815,789,789,707,687,696,689,786,787,713,791,785,791,873,761,762,762,759,759,892,892,788,784,438,138,277,415,392,392,668,668,0,390,390,317,317,276,276,509,509,410,410,234,234,334,334,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,732,544,544,910,667,760,760,776,595,694,626,788,788,788,788,788,788,788,788,788,788,788,788,788,788,788,788,788,788,788,788,788,788,788,788,788,788,788,788,788,788,788,788,788,788,788,788,788,788,788,788,894,838,1016,458,748,924,748,918,927,928,928,834,873,828,924,924,917,930,931,463,883,836,836,867,867,696,696,874,0,874,760,946,771,865,771,888,967,888,831,873,927,970,918,0],
     },
 ];
 

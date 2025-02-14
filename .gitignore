@@ -2,5 +2,7 @@
 /fast-md-to-pdf
 /fast-md-to-pdf.exe
 /fast-md-to-pdf.pdb
+/fast-md-to-pdf.rdi
 
 /*.pdf
+test.md
